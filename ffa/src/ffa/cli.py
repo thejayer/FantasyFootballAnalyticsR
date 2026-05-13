@@ -17,11 +17,22 @@ from ffa.learned import simulate_seasons_learned
 from ffa.league import load_league
 from ffa.optimize import optimize_lineup
 from ffa.projection import project_per_game, project_season
+from ffa.quantile import simulate_seasons_quantile_calibrated
 from ffa.ranking import assign_tiers, compute_vor
 from ffa.scoring import score_player_weeks
 from ffa.simulation import simulate_seasons, summarize_seasons
 
 app = typer.Typer(add_completion=False, help="Fantasy football analytics pipeline.")
+
+
+# Generator name -> (simulator function, history multiplier for training).
+# The learned/quantile generators need more history (training data) than the
+# pure bootstrap, so we pull extra seasons when those are selected.
+_GENERATORS = {
+    "bootstrap": (simulate_seasons, 0),
+    "learned": (simulate_seasons_learned, 2),
+    "quantile": (simulate_seasons_quantile_calibrated, 2),
+}
 
 
 @app.command()
@@ -118,10 +129,10 @@ def simulate(
     decay: float = typer.Option(0.5, "--decay"),
     expected_games: float = typer.Option(17.0, "--expected-games"),
     seed: int = typer.Option(0, "--seed"),
-    learned: bool = typer.Option(
-        False,
-        "--learned",
-        help="Use the learned per-stat generator instead of the empirical bootstrap.",
+    generator: str = typer.Option(
+        "bootstrap",
+        "--generator",
+        help="Generator: bootstrap (phase 3), learned (phase 5), or quantile (phase 6).",
     ),
     limit: int = typer.Option(25, "--limit"),
     out: Path | None = typer.Option(None, "--out", help="Optional Parquet path for the summary."),
@@ -131,7 +142,7 @@ def simulate(
     """Distributional projections; print mean / sd / 5-95 quantiles."""
     _, summary = _load_simulation_summary(
         league, season, samples, lookback, decay, expected_games, seed, db, raw_dir,
-        learned=learned,
+        generator=generator,
     )
 
     if out is not None:
@@ -155,18 +166,24 @@ def _load_simulation_summary(
     seed: int,
     db: Path,
     raw_dir: Path,
-    learned: bool = False,
+    generator: str = "bootstrap",
 ):
     """Shared helper: pull weekly history -> samples -> posterior summary.
 
-    ``learned=True`` swaps the empirical bootstrap for the learned
-    generator; the downstream contract is identical so callers don't care.
+    ``generator`` chooses the simulator: ``bootstrap`` (phase 3),
+    ``learned`` (phase 5), or ``quantile`` (phase 6). All three return
+    the same long DataFrame, so downstream code is identical.
     """
+    if generator not in _GENERATORS:
+        typer.echo(
+            f"Unknown generator: {generator!r}. Choose from: {list(_GENERATORS)}."
+        )
+        raise typer.Exit(code=2)
+
+    simulator, history_pad = _GENERATORS[generator]
     cfg = load_league(league)
     con = open_warehouse(db_path=db, raw_dir=raw_dir)
-    # The learned generator needs training data, so pull more seasons when --learned is on.
-    history_lookback = max(lookback, lookback + 2) if learned else lookback
-    seasons = list(range(season - history_lookback, season))
+    seasons = list(range(season - (lookback + history_pad), season))
     placeholders = ",".join("?" for _ in seasons)
     weekly = con.execute(
         f"SELECT * FROM weekly WHERE season IN ({placeholders})", seasons
@@ -174,7 +191,6 @@ def _load_simulation_summary(
     if weekly.empty:
         typer.echo(f"No weekly history for seasons {seasons}. Run `ffa ingest` first.")
         raise typer.Exit(code=1)
-    simulator = simulate_seasons_learned if learned else simulate_seasons
     samples_df = simulator(
         weekly,
         target_season=season,
@@ -196,6 +212,7 @@ def rank(
     decay: float = typer.Option(0.5, "--decay"),
     expected_games: float = typer.Option(17.0, "--expected-games"),
     seed: int = typer.Option(0, "--seed"),
+    generator: str = typer.Option("bootstrap", "--generator"),
     n_tiers: int = typer.Option(5, "--tiers"),
     limit: int = typer.Option(40, "--limit"),
     db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
@@ -203,7 +220,8 @@ def rank(
 ) -> None:
     """Posterior summary + VOR + tiers."""
     cfg, summary = _load_simulation_summary(
-        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir
+        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir,
+        generator=generator,
     )
     ranked = compute_vor(summary, cfg.roster)
     ranked = assign_tiers(ranked, n_tiers=n_tiers)
@@ -225,6 +243,7 @@ def optimize(
     decay: float = typer.Option(0.5, "--decay"),
     expected_games: float = typer.Option(17.0, "--expected-games"),
     seed: int = typer.Option(0, "--seed"),
+    generator: str = typer.Option("bootstrap", "--generator"),
     db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
     raw_dir: Path = typer.Option(Path("data/raw"), "--raw-dir"),
 ) -> None:
@@ -232,7 +251,8 @@ def optimize(
     import pandas as pd
 
     cfg, summary = _load_simulation_summary(
-        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir
+        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir,
+        generator=generator,
     )
     ranked = compute_vor(summary, cfg.roster)
     if budget is not None:
@@ -260,13 +280,15 @@ def draft_sim(
     decay: float = typer.Option(0.5, "--decay"),
     expected_games: float = typer.Option(17.0, "--expected-games"),
     seed: int = typer.Option(0, "--seed"),
+    generator: str = typer.Option("bootstrap", "--generator"),
     limit: int = typer.Option(25, "--limit"),
     db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
     raw_dir: Path = typer.Option(Path("data/raw"), "--raw-dir"),
 ) -> None:
     """Monte Carlo snake draft from your slot; prints pick-rate table."""
     cfg, summary = _load_simulation_summary(
-        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir
+        league, season, samples, lookback, decay, expected_games, seed, db, raw_dir,
+        generator=generator,
     )
     ranked = compute_vor(summary, cfg.roster)
     result = simulate_draft(
@@ -278,6 +300,49 @@ def draft_sim(
         seed=seed,
     )
     typer.echo(summarize_user_picks(result.user_picks, top=limit).round(2).to_string(index=False))
+
+
+@app.command()
+def dashboard(
+    league: Path = typer.Option(Path("configs/ppr.yaml"), "--league"),
+    season: int = typer.Option(..., "--season"),
+    db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
+    raw_dir: Path = typer.Option(Path("data/raw"), "--raw-dir"),
+    port: int = typer.Option(8501, "--port"),
+) -> None:
+    """Launch the Streamlit dashboard (requires the `dashboard` extra)."""
+    import subprocess
+    import sys
+
+    try:
+        import streamlit  # noqa: F401
+    except ImportError as e:
+        typer.echo(
+            "Streamlit is not installed. Install the dashboard extras:\n"
+            '  pip install -e ".[dashboard]"'
+        )
+        raise typer.Exit(code=1) from e
+
+    app_path = Path(__file__).parent / "dashboard.py"
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.port",
+        str(port),
+        "--",
+        "--league",
+        str(league),
+        "--season",
+        str(season),
+        "--db",
+        str(db),
+        "--raw-dir",
+        str(raw_dir),
+    ]
+    raise typer.Exit(code=subprocess.call(cmd))
 
 
 if __name__ == "__main__":

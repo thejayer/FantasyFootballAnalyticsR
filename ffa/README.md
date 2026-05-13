@@ -1,7 +1,7 @@
 # ffa: fantasy football analytics, rebuilt
 
-A modern replacement for the R scripts in this repo. Phases 1-5 of the
-proposed rebuild are in:
+A modern replacement for the R scripts in this repo. The whole proposed
+rebuild is in:
 
 1. **Ingest + scoring engine** -- nflverse data and pure-function scoring
    driven by YAML league configs.
@@ -15,8 +15,11 @@ proposed rebuild are in:
 5. **Learned per-stat generator** -- sklearn gradient boosting on
    prior-season features; drop-in replacement for the bootstrap with
    the same downstream contract.
-
-No dashboard yet.
+6. **Quantile-calibrated generator** -- per-(position, stat, quantile)
+   regressors plus PIT (probability integral transform) to calibrate
+   marginal tails while preserving cross-stat correlations.
+7. **Streamlit dashboard + GitHub Actions nightly refresh** -- one
+   command to launch the UI; one workflow to keep the warehouse fresh.
 
 ## Why this exists
 
@@ -48,8 +51,8 @@ ffa project --season 2025 --lookback 3 --league configs/ppr.yaml
 # Distributional projection: mean / sd / 5-95 quantiles per player
 ffa simulate --season 2025 --league configs/ppr.yaml --samples 1000
 
-# Same projection but with the learned generator instead of the empirical bootstrap
-ffa simulate --season 2025 --league configs/ppr.yaml --samples 1000 --learned
+# Pick a generator: bootstrap (phase 3), learned (phase 5), quantile (phase 6)
+ffa simulate --season 2025 --league configs/ppr.yaml --generator quantile
 
 # VOR + tiers across positions, posterior-driven
 ffa rank --season 2025 --league configs/ppr.yaml --samples 1000 --tiers 5
@@ -59,6 +62,10 @@ ffa optimize --season 2025 --league configs/ppr.yaml --budget 200 --costs costs.
 
 # Monte Carlo draft from slot 7 in a 12-team snake draft
 ffa draft-sim --season 2025 --league configs/ppr.yaml --slot 7 --sims 500
+
+# Streamlit dashboard (requires the dashboard extra)
+pip install -e ".[dashboard]"
+ffa dashboard --season 2025 --league configs/ppr.yaml
 ```
 
 ## Layout
@@ -72,12 +79,17 @@ ffa/
     projection.py     project_per_game / project_season + depth-chart helpers
     simulation.py     simulate_seasons / summarize_seasons (bootstrap posterior)
     learned.py        LearnedGenerator + simulate_seasons_learned drop-in
+    quantile.py       QuantileGenerator + simulate_seasons_quantile_calibrated
     ranking.py        compute_vor + assign_tiers
     optimize.py       optimize_lineup (PuLP ILP), greedy_lineup
     draft.py          simulate_draft (Monte Carlo snake) + summarize_user_picks
+    dashboard.py      Streamlit UI (rankings, distributions, optimizer, draft)
     ingest.py         nfl_data_py -> Parquet; DuckDB views over the Parquet
-    cli.py            `ffa ingest|score|project|simulate|rank|optimize|draft-sim`
+    cli.py            `ffa ingest|score|project|simulate|rank|optimize|draft-sim|dashboard`
   tests/              Pytest; runs offline on synthetic frames
+.github/workflows/
+  refresh.yml         Scheduled nflverse ingest + posterior write
+  ffa-tests.yml       Run pytest on every push/PR touching ffa/
 ```
 
 ## Design notes
@@ -214,8 +226,58 @@ beating the bootstrap. Multiplicative scaling means stats a player has
 never produced stay at zero -- the right behavior unless and until you
 add a feature that says otherwise.
 
-## Future phases
+## Quantile-calibrated generator (phase 6)
 
-- Phase 6: Quantile regression objective on the learned generator
-  (calibrated tails, not just calibrated means).
-- Phase 7: Streamlit dashboard + nightly GitHub Actions refresh.
+The phase-5 learned generator uses squared-error loss, so its sample
+means are calibrated but its tails inherit whatever shape the player's
+history happened to have. The phase-6 generator addresses that:
+
+    1. Per (position, stat) and per quantile in (0.1, 0.5, 0.9), fit a
+       sklearn `GradientBoostingRegressor(loss="quantile")`.
+    2. Predict each player's marginal stat quantiles. Sort across
+       quantile levels per player to enforce q10 <= q50 <= q90 (sklearn
+       fits each level independently and they can cross with limited data).
+    3. PIT-transform the player's historical game rows: each value is
+       mapped to the linear interpolation of the predicted quantile
+       function at its empirical CDF rank.
+    4. Bootstrap-sample whole transformed rows as in phase 3.
+
+PIT is rank-preserving within each stat and sampling is row-wise, so
+cross-stat correlations (passing yds <-> passing TDs, rush att <-> rush
+yds) survive from the player's own history. The *marginals* are
+calibrated to the model's predicted quantiles; the *copula* is the
+player's own.
+
+CLI:
+
+    ffa simulate --generator quantile --season 2025 --league configs/ppr.yaml
+
+## Dashboard + scheduled refresh (phase 7)
+
+A Streamlit dashboard sits on top of the same library:
+
+    pip install -e ".[dashboard]"
+    ffa dashboard --season 2025 --league configs/ppr.yaml
+
+Tabs: ranked board (VOR + tiers, position filter); per-player
+distribution (floor / median / ceiling + histogram); ILP lineup
+optimizer with optional auction budget; Monte Carlo draft sim with
+pick-rate table.
+
+Two GitHub Actions workflows ship in `.github/workflows/`:
+
+- `ffa-tests.yml`: runs `pytest` on every push/PR that touches `ffa/`.
+- `refresh.yml`: scheduled (weekday mornings during NFL season) and
+  manual; ingests the current season + lookback from nflverse, computes
+  the posterior summary under PPR and Standard, and uploads the Parquet
+  files as build artifacts.
+
+## What's next, post-phase-7
+
+- Per-position joint-distribution learning (deep generator over stat
+  vectors so the *copula* stops being purely the player's own).
+- Schedule-aware adjustments: opponent defense rank, bye-week handling,
+  injury-status updates from the rosters table.
+- Pricing the dashboard's outputs against historical mocks so the
+  optimizer's expected lineup gets calibrated against realized draft
+  results, not just the model's posterior.

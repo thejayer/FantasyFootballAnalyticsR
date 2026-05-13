@@ -1,0 +1,38 @@
+name: ffa tests
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "ffa/**"
+      - ".github/workflows/ffa-tests.yml"
+  pull_request:
+    paths:
+      - "ffa/**"
+      - ".github/workflows/ffa-tests.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: ffa
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: ffa/pyproject.toml
+
+      - name: Install ffa with dev extras
+        run: pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -q

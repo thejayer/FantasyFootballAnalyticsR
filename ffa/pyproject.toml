@@ -27,6 +27,10 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.5",
 ]
+dashboard = [
+    "altair>=5.0",
+    "streamlit>=1.30",
+]
 
 [project.scripts]
 ffa = "ffa.cli:app"

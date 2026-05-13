@@ -8,6 +8,7 @@ from ffa.projection import (
     project_per_game,
     project_season,
 )
+from ffa.quantile import QuantileGenerator, simulate_seasons_quantile_calibrated
 from ffa.ranking import assign_tiers, compute_vor
 from ffa.scoring import score_player_weeks, score_stat_line
 from ffa.simulation import simulate_seasons, summarize_seasons
@@ -16,6 +17,7 @@ __all__ = [
     "DraftResult",
     "LeagueConfig",
     "LearnedGenerator",
+    "QuantileGenerator",
     "RosterRules",
     "apply_depth_multiplier",
     "assign_tiers",
@@ -31,6 +33,7 @@ __all__ = [
     "simulate_draft",
     "simulate_seasons",
     "simulate_seasons_learned",
+    "simulate_seasons_quantile_calibrated",
     "summarize_seasons",
     "summarize_user_picks",
 ]
