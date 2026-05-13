@@ -169,3 +169,16 @@ pip-log.txt
 
 *.Rhistory
 .Rhistory
+
+#############
+## ffa (modern Python pipeline)
+#############
+
+ffa/.venv/
+ffa/data/
+ffa/.pytest_cache/
+ffa/.ruff_cache/
+ffa/**/__pycache__/
+ffa/**/*.egg-info/
+ffa/dist/
+ffa/build/
