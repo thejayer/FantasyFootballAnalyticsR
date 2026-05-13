@@ -13,6 +13,7 @@ import typer
 
 from ffa.ingest import ingest_seasons, open_warehouse
 from ffa.league import load_league
+from ffa.projection import project_per_game, project_season
 from ffa.scoring import score_player_weeks
 
 app = typer.Typer(add_completion=False, help="Fantasy football analytics pipeline.")
@@ -56,6 +57,51 @@ def score(
     cols = [c for c in ("player_display_name", "position", "recent_team", "week") if c in weekly.columns]
     out = weekly[[*cols, "fantasy_points"]].sort_values("fantasy_points", ascending=False).head(limit)
     typer.echo(out.to_string(index=False))
+
+
+@app.command()
+def project(
+    season: int = typer.Option(..., "--season", help="Season to project."),
+    lookback: int = typer.Option(3, "--lookback", help="Prior seasons to use."),
+    decay: float = typer.Option(0.5, "--decay", help="Exponential recency decay."),
+    expected_games: float = typer.Option(17.0, "--expected-games"),
+    league: Path | None = typer.Option(None, "--league", help="If given, also score the projection."),
+    limit: int = typer.Option(25, "--limit"),
+    out: Path | None = typer.Option(None, "--out", help="Optional Parquet path to write the projection."),
+    db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
+    raw_dir: Path = typer.Option(Path("data/raw"), "--raw-dir"),
+) -> None:
+    """Recency-weighted baseline projection from ingested weekly history."""
+    con = open_warehouse(db_path=db, raw_dir=raw_dir)
+    seasons = list(range(season - lookback, season))
+    placeholders = ",".join("?" for _ in seasons)
+    weekly = con.execute(
+        f"SELECT * FROM weekly WHERE season IN ({placeholders})", seasons
+    ).df()
+    if weekly.empty:
+        typer.echo(
+            f"No weekly history found for seasons {seasons}. Run `ffa ingest` first."
+        )
+        raise typer.Exit(code=1)
+
+    per_game = project_per_game(weekly, target_season=season, lookback=lookback, decay=decay)
+    season_df = project_season(per_game, expected_games=expected_games)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        season_df.to_parquet(out, index=False)
+        typer.echo(f"Wrote {len(season_df):,} rows -> {out}")
+
+    if league is not None:
+        cfg = load_league(league)
+        season_df["fantasy_points"] = score_player_weeks(season_df, cfg)
+        cols = [c for c in ("player_display_name", "position", "recent_team") if c in season_df.columns]
+        out_df = (
+            season_df[[*cols, "fantasy_points"]]
+            .sort_values("fantasy_points", ascending=False)
+            .head(limit)
+        )
+        typer.echo(out_df.to_string(index=False))
 
 
 if __name__ == "__main__":
