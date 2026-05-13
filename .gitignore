@@ -182,8 +182,3 @@ ffa/**/__pycache__/
 ffa/**/*.egg-info/
 ffa/dist/
 ffa/build/
-
-# Scratch handoff for the new fantasy-sports repo. Move the folder out of
-# this tree to wherever you keep projects, then delete these locally.
-fantasy-sports/
-fantasy-sports.tar.gz
