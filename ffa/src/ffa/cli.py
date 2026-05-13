@@ -15,6 +15,7 @@ from ffa.ingest import ingest_seasons, open_warehouse
 from ffa.league import load_league
 from ffa.projection import project_per_game, project_season
 from ffa.scoring import score_player_weeks
+from ffa.simulation import simulate_seasons, summarize_seasons
 
 app = typer.Typer(add_completion=False, help="Fantasy football analytics pipeline.")
 
@@ -102,6 +103,56 @@ def project(
             .head(limit)
         )
         typer.echo(out_df.to_string(index=False))
+
+
+@app.command()
+def simulate(
+    league: Path = typer.Option(..., "--league", help="Path to a league YAML."),
+    season: int = typer.Option(..., "--season"),
+    samples: int = typer.Option(1000, "--samples", help="Bootstrap samples per player."),
+    lookback: int = typer.Option(3, "--lookback"),
+    decay: float = typer.Option(0.5, "--decay"),
+    expected_games: float = typer.Option(17.0, "--expected-games"),
+    seed: int = typer.Option(0, "--seed"),
+    limit: int = typer.Option(25, "--limit"),
+    out: Path | None = typer.Option(None, "--out", help="Optional Parquet path for the summary."),
+    db: Path = typer.Option(Path("data/ffa.duckdb"), "--db"),
+    raw_dir: Path = typer.Option(Path("data/raw"), "--raw-dir"),
+) -> None:
+    """Bootstrap distributional projections; print mean / sd / 5-95 quantiles."""
+    cfg = load_league(league)
+    con = open_warehouse(db_path=db, raw_dir=raw_dir)
+    seasons = list(range(season - lookback, season))
+    placeholders = ",".join("?" for _ in seasons)
+    weekly = con.execute(
+        f"SELECT * FROM weekly WHERE season IN ({placeholders})", seasons
+    ).df()
+    if weekly.empty:
+        typer.echo(
+            f"No weekly history found for seasons {seasons}. Run `ffa ingest` first."
+        )
+        raise typer.Exit(code=1)
+
+    samples_df = simulate_seasons(
+        weekly,
+        target_season=season,
+        n_samples=samples,
+        lookback=lookback,
+        decay=decay,
+        expected_games=expected_games,
+        seed=seed,
+    )
+    summary = summarize_seasons(samples_df, cfg)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        summary.to_parquet(out, index=False)
+        typer.echo(f"Wrote {len(summary):,} rows -> {out}")
+
+    cols = [c for c in ("player_display_name", "position", "recent_team") if c in summary.columns]
+    show = [*cols, "points_mean", "points_sd", "q05", "q50", "q95"]
+    show = [c for c in show if c in summary.columns]
+    typer.echo(summary[show].head(limit).round(1).to_string(index=False))
 
 
 if __name__ == "__main__":

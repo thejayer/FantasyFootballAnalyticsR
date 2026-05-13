@@ -6,6 +6,7 @@ from ffa.projection import (
     project_season,
 )
 from ffa.scoring import score_player_weeks, score_stat_line
+from ffa.simulation import simulate_seasons, summarize_seasons
 
 __all__ = [
     "LeagueConfig",
@@ -16,4 +17,6 @@ __all__ = [
     "project_season",
     "score_player_weeks",
     "score_stat_line",
+    "simulate_seasons",
+    "summarize_seasons",
 ]

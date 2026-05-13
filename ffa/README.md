@@ -1,12 +1,15 @@
 # ffa: fantasy football analytics, rebuilt
 
-A modern replacement for the R scripts in this repo. Phases 1-2 of the
+A modern replacement for the R scripts in this repo. Phases 1-3 of the
 proposed rebuild are in:
 
 1. **Ingest + scoring engine** -- nflverse data and pure-function scoring
    driven by YAML league configs.
 2. **Baseline projection model** -- recency-weighted per-game stats with
    optional depth-chart adjustment.
+3. **Distributional projections** -- weighted block bootstrap over game
+   rows produces a joint posterior over stats; risk and confidence
+   intervals are quantiles of the resulting fantasy point distribution.
 
 No optimizer or dashboard yet.
 
@@ -36,6 +39,9 @@ ffa score --league configs/ppr.yaml --season 2024 --week 5
 
 # Baseline 2025 projection from the last 3 seasons, scored under PPR
 ffa project --season 2025 --lookback 3 --league configs/ppr.yaml
+
+# Distributional projection: mean / sd / 5-95 quantiles per player
+ffa simulate --season 2025 --league configs/ppr.yaml --samples 1000
 ```
 
 ## Layout
@@ -47,8 +53,9 @@ ffa/
     league.py         Pydantic schema; load_league(path) -> LeagueConfig
     scoring.py        Pure: score_player_weeks(stats_df, league) -> Series
     projection.py     project_per_game / project_season + depth-chart helpers
+    simulation.py     simulate_seasons / summarize_seasons (bootstrap posterior)
     ingest.py         nfl_data_py -> Parquet; DuckDB views over the Parquet
-    cli.py            `ffa ingest`, `ffa score`, `ffa project`
+    cli.py            `ffa ingest`, `ffa score`, `ffa project`, `ffa simulate`
   tests/              Pytest; runs offline on synthetic frames
 ```
 
@@ -82,13 +89,52 @@ default, because recency-weighted projections already reflect past roles.
 `project_season(per_game, expected_games=17.0)` produces season totals;
 `expected_games` may be a Series for per-player injury overrides.
 
-The next phase replaces the recency-weighted mean with a learned per-stat
-distribution (trained on PBP) so risk and confidence intervals come out
-natively rather than as a hack on top of pundit disagreement.
+## Distributional projections (phase 3)
+
+`simulate_seasons(weekly, target_season, n_samples=1000, ...)` produces a
+*joint* posterior over a player's stats by **weighted block bootstrap**:
+
+1. Take the player's game-level rows from the lookback window.
+2. Weight each row by `exp(-decay * age_in_seasons)`.
+3. Sample `expected_games` rows with replacement, weighted by recency.
+4. Sum each draw to get one simulated season total -- repeat `n_samples`
+   times to fill the posterior.
+
+Because the unit of sampling is a *whole game row*, cross-stat
+correlations (pass yds <-> pass TDs, rush att <-> rush yds) are preserved
+without estimating a covariance matrix or copula. Heavy-tailed stats
+(TDs) come out skewed for free.
+
+The output is a long DataFrame `(player_id, sample_idx, ...stats...)`
+with one row per simulated season. The pure scoring engine
+`score_player_weeks` runs on the whole frame in one call, so:
+
+```python
+summary = summarize_seasons(samples, league)
+# columns: player_id, [meta], points_mean, points_sd, q05, q25, q50, q75, q95
+```
+
+Risk-style metrics (floor, ceiling, sharpe-of-points) are intentionally
+*derivable* from those columns rather than pre-computed -- different
+leagues weight downside vs upside differently.
+
+### Why this and not LightGBM?
+
+A learned per-stat model (LightGBM, hierarchical Bayes) is the natural
+next upgrade. It would *condition* the sampling distribution on features
+(age, team change, opponent strength, snap share). For now, the
+nonparametric bootstrap:
+
+- has no new heavy dependency,
+- preserves correlations automatically,
+- captures skewness from real game-level data,
+- and produces the same downstream contract (long DataFrame of
+  samples), so swapping in a learned generator later is a drop-in.
 
 ## Future phases
 
-- Phase 3: learned per-stat model -> stat distributions -> risk/CIs from
-  posterior quantiles.
-- Phase 4: ILP roster optimizer (PuLP/OR-Tools), Monte Carlo draft sim.
-- Phase 5: Streamlit dashboard + nightly GitHub Actions refresh.
+- Phase 4: VOR / tiers / ILP roster optimizer / Monte Carlo draft sim,
+  all consuming the posterior from phase 3.
+- Phase 5: Learned per-stat generator (LightGBM quantile regression or
+  hierarchical Bayes) replacing the empirical bootstrap.
+- Phase 6: Streamlit dashboard + nightly GitHub Actions refresh.
