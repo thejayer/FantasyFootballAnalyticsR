@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, NonNegativeFloat
+from pydantic import BaseModel, Field, NonNegativeFloat, NonNegativeInt, PositiveInt
 
 
 class YardageBonus(BaseModel):
@@ -57,6 +57,51 @@ class KickingRules(BaseModel):
     fg_missed: float = 0.0
 
 
+class RosterRules(BaseModel):
+    """Roster slots per team and league size.
+
+    ``flex`` is RB/WR/TE-eligible by convention. For VOR we split the flex
+    pool evenly across those three positions (a common approximation; for a
+    league with a TE-premium flex, edit ``flex_split`` accordingly).
+    """
+
+    teams: PositiveInt = 12
+    qb: NonNegativeInt = 1
+    rb: NonNegativeInt = 2
+    wr: NonNegativeInt = 2
+    te: NonNegativeInt = 1
+    flex: NonNegativeInt = 1
+    k: NonNegativeInt = 1
+    dst: NonNegativeInt = 1
+    bench: NonNegativeInt = 6
+    flex_split: dict[str, float] = Field(
+        default_factory=lambda: {"RB": 1 / 3, "WR": 1 / 3, "TE": 1 / 3}
+    )
+
+    def starters_at(self, position: str) -> float:
+        """Per-team starter count at a position, including flex share."""
+        pos = position.upper()
+        base = {
+            "QB": self.qb,
+            "RB": self.rb,
+            "WR": self.wr,
+            "TE": self.te,
+            "K": self.k,
+            "DST": self.dst,
+        }.get(pos, 0)
+        return float(base) + self.flex * self.flex_split.get(pos, 0.0)
+
+    def replacement_index(self, position: str) -> int:
+        """0-indexed rank of the 'first non-starter' at this position.
+
+        Across the whole league, ``teams * starters_at(pos)`` players are
+        drafted as starters. The replacement-level player is the next one
+        down -- so the index ``teams * starters_at(pos)`` (0-indexed) is
+        what we compare against for VOR.
+        """
+        return int(round(self.teams * self.starters_at(position)))
+
+
 class LeagueConfig(BaseModel):
     """Top-level league config.
 
@@ -70,6 +115,7 @@ class LeagueConfig(BaseModel):
     receiving: ReceivingRules = Field(default_factory=ReceivingRules)
     misc: MiscRules = Field(default_factory=MiscRules)
     kicking: KickingRules = Field(default_factory=KickingRules)
+    roster: RosterRules = Field(default_factory=RosterRules)
 
 
 def load_league(path: str | Path) -> LeagueConfig:

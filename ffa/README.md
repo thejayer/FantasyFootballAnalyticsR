@@ -1,6 +1,6 @@
 # ffa: fantasy football analytics, rebuilt
 
-A modern replacement for the R scripts in this repo. Phases 1-3 of the
+A modern replacement for the R scripts in this repo. Phases 1-5 of the
 proposed rebuild are in:
 
 1. **Ingest + scoring engine** -- nflverse data and pure-function scoring
@@ -10,8 +10,13 @@ proposed rebuild are in:
 3. **Distributional projections** -- weighted block bootstrap over game
    rows produces a joint posterior over stats; risk and confidence
    intervals are quantiles of the resulting fantasy point distribution.
+4. **VOR + tiers + roster optimizer + Monte Carlo draft sim** -- all
+   consuming the posterior from phase 3.
+5. **Learned per-stat generator** -- sklearn gradient boosting on
+   prior-season features; drop-in replacement for the bootstrap with
+   the same downstream contract.
 
-No optimizer or dashboard yet.
+No dashboard yet.
 
 ## Why this exists
 
@@ -42,6 +47,18 @@ ffa project --season 2025 --lookback 3 --league configs/ppr.yaml
 
 # Distributional projection: mean / sd / 5-95 quantiles per player
 ffa simulate --season 2025 --league configs/ppr.yaml --samples 1000
+
+# Same projection but with the learned generator instead of the empirical bootstrap
+ffa simulate --season 2025 --league configs/ppr.yaml --samples 1000 --learned
+
+# VOR + tiers across positions, posterior-driven
+ffa rank --season 2025 --league configs/ppr.yaml --samples 1000 --tiers 5
+
+# ILP-optimal lineup under an auction budget
+ffa optimize --season 2025 --league configs/ppr.yaml --budget 200 --costs costs.csv
+
+# Monte Carlo draft from slot 7 in a 12-team snake draft
+ffa draft-sim --season 2025 --league configs/ppr.yaml --slot 7 --sims 500
 ```
 
 ## Layout
@@ -54,8 +71,12 @@ ffa/
     scoring.py        Pure: score_player_weeks(stats_df, league) -> Series
     projection.py     project_per_game / project_season + depth-chart helpers
     simulation.py     simulate_seasons / summarize_seasons (bootstrap posterior)
+    learned.py        LearnedGenerator + simulate_seasons_learned drop-in
+    ranking.py        compute_vor + assign_tiers
+    optimize.py       optimize_lineup (PuLP ILP), greedy_lineup
+    draft.py          simulate_draft (Monte Carlo snake) + summarize_user_picks
     ingest.py         nfl_data_py -> Parquet; DuckDB views over the Parquet
-    cli.py            `ffa ingest`, `ffa score`, `ffa project`, `ffa simulate`
+    cli.py            `ffa ingest|score|project|simulate|rank|optimize|draft-sim`
   tests/              Pytest; runs offline on synthetic frames
 ```
 
@@ -131,10 +152,70 @@ nonparametric bootstrap:
 - and produces the same downstream contract (long DataFrame of
   samples), so swapping in a learned generator later is a drop-in.
 
+## VOR, tiers, and the ILP optimizer (phase 4)
+
+`compute_vor(summary, roster)` makes points comparable across positions
+by subtracting the replacement-level baseline. Replacement at position
+`p` is the projection of the player whose within-position rank equals
+`teams * (starters[p] + flex_share)`, so the math respects flex slots
+without double-counting.
+
+`assign_tiers(summary, n_tiers=5)` partitions each position's players
+at the largest consecutive point gaps. Interpretable -- a tier always
+corresponds to a visible step in the sorted projections -- and the only
+parameter is the tier count.
+
+`optimize_lineup(values, roster, costs=None, budget=None)` solves an
+ILP via PuLP: maximize total `vor` (or any value column) subject to
+slot counts, flex eligibility (RB/WR/TE), and an optional budget when
+costs are supplied. With no budget the ILP collapses to "take the top
+players at each slot" (and `greedy_lineup` does the same without PuLP).
+
+`simulate_draft(values, roster, user_slot, n_sims=500)` Monte Carlo
+snake draft. Opponents pick by ADP plus log-normal noise; the user
+picks the highest-VOR player that fills a remaining roster slot. Returns
+both the user's per-sim picks and the per-player availability matrix
+("probability X is on the board at my next pick") -- the right input
+for planning two picks ahead.
+
+## Learned generator (phase 5)
+
+The phase-3 bootstrap can't extrapolate: a player's projection is the
+recency-weighted mean of their own past. The learned generator
+addresses that by fitting per-(position, stat) regressors on prior-
+season features:
+
+    last_season_per_game[stat]    last_season_games_played
+    two_seasons_ago_per_game      weighted_career_per_game
+    career_games_in_window
+
+At sample time, predict each player's per-game mean for the target
+season, scale the player's historical game rows multiplicatively so
+their mean matches the prediction, then bootstrap-sample as before.
+This preserves the within-player variability structure (skewness,
+inter-stat correlation) while letting the model pull predictions
+toward what the cohort actually does after a feature profile like the
+player's.
+
+`simulate_seasons_learned` is a drop-in for `simulate_seasons`:
+
+    samples = simulate_seasons_learned(weekly, target_season=2025, n_samples=1000)
+    summary = summarize_seasons(samples, league_config)
+
+CLI:
+
+    ffa simulate --learned --season 2025 --league configs/ppr.yaml
+
+**Honest caveat.** With just a few seasons of nflverse weekly data the
+learned model has limited room to outperform the recency-weighted
+bootstrap. The value is the *pattern*: with more features (snap share,
+opponent rank, depth-chart shifts, age) the same architecture starts
+beating the bootstrap. Multiplicative scaling means stats a player has
+never produced stay at zero -- the right behavior unless and until you
+add a feature that says otherwise.
+
 ## Future phases
 
-- Phase 4: VOR / tiers / ILP roster optimizer / Monte Carlo draft sim,
-  all consuming the posterior from phase 3.
-- Phase 5: Learned per-stat generator (LightGBM quantile regression or
-  hierarchical Bayes) replacing the empirical bootstrap.
-- Phase 6: Streamlit dashboard + nightly GitHub Actions refresh.
+- Phase 6: Quantile regression objective on the learned generator
+  (calibrated tails, not just calibrated means).
+- Phase 7: Streamlit dashboard + nightly GitHub Actions refresh.

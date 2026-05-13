@@ -13,9 +13,11 @@ dependencies = [
     "duckdb>=1.0",
     "nfl-data-py>=0.3.2",
     "pandas>=2.1",
+    "pulp>=2.8",
     "pyarrow>=15.0",
     "pydantic>=2.6",
     "pyyaml>=6.0",
+    "scikit-learn>=1.4",
     "typer>=0.12",
 ]
 
@@ -35,6 +37,9 @@ packages = ["src/ffa"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+filterwarnings = [
+    "ignore:Constructing LpVariable.*:DeprecationWarning:pulp",
+]
 
 [tool.ruff]
 line-length = 100
