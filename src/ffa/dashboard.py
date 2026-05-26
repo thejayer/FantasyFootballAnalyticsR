@@ -131,18 +131,9 @@ def availability_view(availability: pd.DataFrame, ranked: pd.DataFrame, top: int
     return merged[[*display_cols, *round_cols]].reset_index(drop=True)
 
 
-@st.cache_data(show_spinner="Loading weekly history...")
-def _load_weekly(seasons: tuple[int, ...], db: str, raw_dir: str) -> pd.DataFrame:
-    con = open_warehouse(db_path=db, raw_dir=raw_dir)
-    placeholders = ",".join("?" for _ in seasons)
-    return con.execute(
-        f"SELECT * FROM weekly WHERE season IN ({placeholders})", list(seasons)
-    ).df()
-
-
-@st.cache_data(show_spinner="Running simulations...")
-def _simulate(
-    weekly: pd.DataFrame,
+@st.cache_data(show_spinner="Crunching projections...")
+def build_ranked(
+    league_path: str,
     season: int,
     generator: str,
     samples: int,
@@ -150,9 +141,28 @@ def _simulate(
     decay: float,
     expected_games: float,
     seed: int,
-) -> pd.DataFrame:
-    simulator = _GENERATORS[generator]
-    return simulator(
+    db: str,
+    raw_dir: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the whole projection pipeline once and cache the result.
+
+    Returns ``(ranked, samples_df)``. Keyed entirely on scalar arguments,
+    so Streamlit reuses the cached result across reruns and across all four
+    tabs -- the expensive simulate -> summarize -> VOR -> tier work happens
+    once per unique parameter set, not on every widget interaction.
+    """
+    league = load_league(league_path)
+    history_pad = 0 if generator == "bootstrap" else 2
+    seasons = list(range(season - (lookback + history_pad), season))
+    con = open_warehouse(db_path=db, raw_dir=raw_dir)
+    placeholders = ",".join("?" for _ in seasons)
+    weekly = con.execute(
+        f"SELECT * FROM weekly WHERE season IN ({placeholders})", seasons
+    ).df()
+    if weekly.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    samples_df = _GENERATORS[generator](
         weekly,
         target_season=season,
         n_samples=samples,
@@ -161,6 +171,54 @@ def _simulate(
         expected_games=expected_games,
         seed=seed,
     )
+    if samples_df.empty:
+        return pd.DataFrame(), samples_df
+
+    summary = summarize_seasons(samples_df, league)
+    ranked = compute_vor(summary, league.roster)
+    ranked = assign_tiers(ranked, n_tiers=5)
+    return ranked, samples_df
+
+
+@st.cache_data(show_spinner="Simulating drafts...")
+def cached_draft(
+    _ranked: pd.DataFrame,
+    _roster,
+    cache_key: tuple,
+    user_slot: int,
+    n_sims: int,
+    opponent_noise: float,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cached Monte Carlo draft. Heavy args are underscore-prefixed so
+    Streamlit doesn't hash them; ``cache_key`` (the build_ranked params)
+    plus the draft params fully determine the result and drive invalidation.
+    """
+    result = simulate_draft(
+        _ranked,
+        _roster,
+        user_slot=user_slot,
+        n_sims=n_sims,
+        opponent_noise=opponent_noise,
+        seed=seed,
+    )
+    return result.user_picks, result.availability
+
+
+@st.cache_data(show_spinner="Optimizing lineup...")
+def cached_optimize(
+    _ranked: pd.DataFrame,
+    _roster,
+    cache_key: tuple,
+    budget: float,
+    costs_items: tuple,
+) -> pd.DataFrame:
+    """Cached ILP lineup. Same underscore/cache_key pattern as cached_draft."""
+    if budget > 0 and costs_items:
+        costs = pd.Series(dict(costs_items))
+        return optimize_lineup(_ranked, _roster, costs=costs, budget=budget)
+    return optimize_lineup(_ranked, _roster)
+
 
 
 def _password_gate() -> None:
@@ -231,27 +289,22 @@ def main() -> None:
     db_path = str(args.db)
     raw_dir = str(args.raw_dir)
 
-    history_pad = 0 if generator == "bootstrap" else 2
-    seasons = tuple(range(season - (lookback + history_pad), season))
-    weekly = _load_weekly(seasons, db_path, raw_dir)
-    if weekly.empty:
+    # Single cached call runs the whole pipeline; this is what keeps every
+    # tab interaction fast. The cache key is all the scalar params below.
+    cache_key = (
+        str(league_path), season, generator, samples, lookback, decay, expected_games, seed
+    )
+    ranked, samples_df = build_ranked(
+        str(league_path), season, generator, samples, lookback, decay, expected_games, seed,
+        db_path, raw_dir,
+    )
+    if ranked.empty:
         st.error(
-            f"No weekly history found for seasons {list(seasons)}. "
-            "Run `ffa ingest` to populate the warehouse, or pick a season "
-            "your data covers."
+            "No projections to show. Either there's no weekly history for the "
+            "lookback window, or the simulation produced no samples. Run "
+            "`ffa ingest` for the needed seasons, or pick a season your data covers."
         )
         return
-
-    samples_df = _simulate(
-        weekly, season, generator, samples, lookback, decay, expected_games, seed
-    )
-    if samples_df.empty:
-        st.error("Simulation produced no samples. Try a different season or generator.")
-        return
-
-    summary = summarize_seasons(samples_df, league)
-    ranked = compute_vor(summary, league.roster)
-    ranked = assign_tiers(ranked, n_tiers=5)
 
     tab_board, tab_player, tab_optimize, tab_draft = st.tabs(
         ["Ranked board", "Player distribution", "Lineup optimizer", "Draft sim"]
@@ -331,16 +384,16 @@ def main() -> None:
         with col2:
             costs_file = st.file_uploader("Costs CSV (player_id, cost)", type=["csv"])
 
+        costs_items: tuple = ()
+        if budget > 0 and costs_file is not None:
+            costs_df = pd.read_csv(costs_file)
+            costs_items = tuple(sorted(costs_df.set_index("player_id")["cost"].items()))
+        elif budget > 0 and costs_file is None:
+            st.info("Upload a costs CSV to optimize under a budget; showing the no-cap lineup.")
+            budget = 0.0
+
         try:
-            if budget > 0 and costs_file is not None:
-                costs_df = pd.read_csv(costs_file)
-                costs = costs_df.set_index("player_id")["cost"]
-                lineup = optimize_lineup(ranked, league.roster, costs=costs, budget=budget)
-            elif budget > 0 and costs_file is None:
-                st.info("Upload a costs CSV to optimize under a budget.")
-                lineup = optimize_lineup(ranked, league.roster)
-            else:
-                lineup = optimize_lineup(ranked, league.roster)
+            lineup = cached_optimize(ranked, league.roster, cache_key, budget, costs_items)
         except Exception as e:  # noqa: BLE001
             st.error(f"Optimizer error: {e}")
             lineup = pd.DataFrame()
@@ -370,22 +423,17 @@ def main() -> None:
             opponent_noise = float(st.slider("Opponent ADP noise", 0.05, 0.6, 0.25, step=0.05))
 
         try:
-            result = simulate_draft(
-                ranked,
-                league.roster,
-                user_slot=user_slot,
-                n_sims=n_sims,
-                opponent_noise=opponent_noise,
-                seed=seed,
+            user_picks, availability = cached_draft(
+                ranked, league.roster, cache_key, user_slot, n_sims, opponent_noise, seed
             )
         except Exception as e:  # noqa: BLE001
             st.error(f"Draft sim error: {e}")
-            result = None
+            user_picks, availability = None, None
 
-        if result is not None:
+        if user_picks is not None:
             st.subheader("Who you tend to land")
             st.caption("Across all simulated drafts from your slot.")
-            picks = summarize_user_picks(result.user_picks, top=40)
+            picks = summarize_user_picks(user_picks, top=40)
             st.dataframe(picks, use_container_width=True, hide_index=True)
 
             st.subheader("Availability at each of your picks")
@@ -393,7 +441,7 @@ def main() -> None:
                 "Probability (%) a player is still on the board when your pick "
                 "comes up in each round. The planning view for two picks ahead."
             )
-            avail = availability_view(result.availability, ranked, top=40)
+            avail = availability_view(availability, ranked, top=40)
             round_cols = [c for c in avail.columns if c.startswith("round_")]
             avail_cfg = {
                 "player_display_name": st.column_config.TextColumn("Player"),
